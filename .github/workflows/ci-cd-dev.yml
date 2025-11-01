@@ -1,17 +1,27 @@
-name: Cloud Config - Dev CI/CD
+name: Cloud Config - CI/CD
 
 on:
   push:
     branches:
       - develop
       - dev
+      - stage
+      - main
+      - master
+  pull_request:
+    branches:
+      - develop
+      - dev
+      - stage
+      - main
+      - master
   workflow_dispatch:
 
 env:
   REGISTRY: docker.io
   IMAGE_NAME: juanc7773/cloud-config
   SERVICE_NAME: cloud-config
-  KUBERNETES_NAMESPACE: ecommerce-dev
+  KUBERNETES_NAMESPACE: ecommerce-dev  # Siempre mismo namespace (estrategia del profe)
 
 jobs:
   build-and-test:
@@ -61,13 +71,27 @@ jobs:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
         
+    - name: Determine image tag
+      id: tag
+      run: |
+        if [[ "${{ github.ref }}" == "refs/heads/main" ]] || [[ "${{ github.ref }}" == "refs/heads/master" ]]; then
+          echo "IMAGE_TAG=prod-0.1.0" >> $GITHUB_OUTPUT
+          echo "ENV_NAME=production" >> $GITHUB_OUTPUT
+        elif [[ "${{ github.ref }}" == "refs/heads/stage" ]]; then
+          echo "IMAGE_TAG=stage-latest" >> $GITHUB_OUTPUT
+          echo "ENV_NAME=staging" >> $GITHUB_OUTPUT
+        else
+          echo "IMAGE_TAG=dev-latest" >> $GITHUB_OUTPUT
+          echo "ENV_NAME=development" >> $GITHUB_OUTPUT
+        fi
+        
     - name: Extract metadata
       id: meta
       uses: docker/metadata-action@v5
       with:
         images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         tags: |
-          type=raw,value=dev-latest
+          type=raw,value=${{ steps.tag.outputs.IMAGE_TAG }}
           type=sha,format=short
           type=raw,value=0.1.0
           
@@ -85,8 +109,8 @@ jobs:
         cache-from: type=gha
         cache-to: type=gha,mode=max
         
-  deploy-dev:
-    name: Deploy to Kubernetes (Dev)
+  deploy:
+    name: Deploy to Kubernetes
     needs: build-docker
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
@@ -95,6 +119,20 @@ jobs:
       contents: read
     
     steps:
+    - name: Determine environment and tag
+      id: env
+      run: |
+        if [[ "${{ github.ref }}" == "refs/heads/main" ]] || [[ "${{ github.ref }}" == "refs/heads/master" ]]; then
+          echo "IMAGE_TAG=prod-0.1.0" >> $GITHUB_OUTPUT
+          echo "ENV_NAME=production" >> $GITHUB_OUTPUT
+        elif [[ "${{ github.ref }}" == "refs/heads/stage" ]]; then
+          echo "IMAGE_TAG=stage-latest" >> $GITHUB_OUTPUT
+          echo "ENV_NAME=staging" >> $GITHUB_OUTPUT
+        else
+          echo "IMAGE_TAG=dev-latest" >> $GITHUB_OUTPUT
+          echo "ENV_NAME=development" >> $GITHUB_OUTPUT
+        fi
+        
     - name: Checkout code
       uses: actions/checkout@v4
       
@@ -124,12 +162,12 @@ jobs:
         
     - name: Deploy to Kubernetes
       run: |
-        # Use dev-latest tag for dev environment
-        IMAGE_NAME="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev-latest"
+        # Use dynamic tag based on branch (siempre mismo namespace: ecommerce-dev)
+        IMAGE_NAME="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.env.outputs.IMAGE_TAG }}"
         
         # Create temporary deployment file from infra repo
         cp infra/k8s/cloud-config/deployment.yaml deployment.tmp.yaml
-        sed -i "s|juanc7773/cloud-config:0.1.0|${IMAGE_NAME}|g" deployment.tmp.yaml
+        sed -i "s|<REGISTRY>/cloud-config:0.1.0|${IMAGE_NAME}|g" deployment.tmp.yaml
         
         kubectl apply -f deployment.tmp.yaml -n ${{ env.KUBERNETES_NAMESPACE }}
         
@@ -139,10 +177,8 @@ jobs:
     - name: Wait for deployment
       run: |
         kubectl rollout status deployment/${{ env.SERVICE_NAME }} -n ${{ env.KUBERNETES_NAMESPACE }} --timeout=600s || true
-        # No falla si el rollout tarda más (por recursos limitados en dev)
         
     - name: Verify deployment
       run: |
         kubectl get pods -n ${{ env.KUBERNETES_NAMESPACE }} -l app=${{ env.SERVICE_NAME }}
         kubectl get svc -n ${{ env.KUBERNETES_NAMESPACE }} -l app=${{ env.SERVICE_NAME }}
-
