@@ -174,6 +174,19 @@ jobs:
         # Cleanup
         rm deployment.tmp.yaml
         
+    - name: Force rollout restart (para tags estáticos como dev-latest)
+      run: |
+        # Cuando usamos tags estáticos (dev-latest, stage-latest), Kubernetes puede no detectar
+        # que la imagen cambió. Forzamos el restart para asegurar que descargue la nueva imagen.
+        if [[ "${{ steps.env.outputs.IMAGE_TAG }}" == "dev-latest" ]] || \
+           [[ "${{ steps.env.outputs.IMAGE_TAG }}" == "stage-latest" ]]; then
+          echo "Tag estático detectado: ${{ steps.env.outputs.IMAGE_TAG }}"
+          echo "Forzando rollout restart para asegurar descarga de nueva imagen..."
+          kubectl rollout restart deployment/${{ env.SERVICE_NAME }} -n ${{ env.KUBERNETES_NAMESPACE }}
+        else
+          echo "Tag único detectado: ${{ steps.env.outputs.IMAGE_TAG }}, no se necesita restart forzado"
+        fi
+        
     - name: Wait for deployment
       run: |
         kubectl rollout status deployment/${{ env.SERVICE_NAME }} -n ${{ env.KUBERNETES_NAMESPACE }} --timeout=600s || true
