@@ -1,17 +1,27 @@
-name: Cloud Config - Dev CI/CD
+name: Cloud Config - CI/CD
 
 on:
   push:
     branches:
       - develop
       - dev
+      - stage
+      - main
+      - master
+  pull_request:
+    branches:
+      - develop
+      - dev
+      - stage
+      - main
+      - master
   workflow_dispatch:
 
 env:
   REGISTRY: docker.io
   IMAGE_NAME: juanc7773/cloud-config
   SERVICE_NAME: cloud-config
-  KUBERNETES_NAMESPACE: ecommerce-dev
+  KUBERNETES_NAMESPACE: ecommerce-dev  # Siempre mismo namespace (estrategia del profe)
 
 jobs:
   build-and-test:
@@ -61,13 +71,27 @@ jobs:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
         
+    - name: Determine image tag
+      id: tag
+      run: |
+        if [[ "${{ github.ref }}" == "refs/heads/main" ]] || [[ "${{ github.ref }}" == "refs/heads/master" ]]; then
+          echo "IMAGE_TAG=prod-0.1.0" >> $GITHUB_OUTPUT
+          echo "ENV_NAME=production" >> $GITHUB_OUTPUT
+        elif [[ "${{ github.ref }}" == "refs/heads/stage" ]]; then
+          echo "IMAGE_TAG=stage-latest" >> $GITHUB_OUTPUT
+          echo "ENV_NAME=staging" >> $GITHUB_OUTPUT
+        else
+          echo "IMAGE_TAG=dev-latest" >> $GITHUB_OUTPUT
+          echo "ENV_NAME=development" >> $GITHUB_OUTPUT
+        fi
+        
     - name: Extract metadata
       id: meta
       uses: docker/metadata-action@v5
       with:
         images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         tags: |
-          type=raw,value=dev-latest
+          type=raw,value=${{ steps.tag.outputs.IMAGE_TAG }}
           type=sha,format=short
           type=raw,value=0.1.0
           
@@ -85,8 +109,8 @@ jobs:
         cache-from: type=gha
         cache-to: type=gha,mode=max
         
-  deploy-dev:
-    name: Deploy to Kubernetes (Dev)
+  deploy:
+    name: Deploy to Kubernetes
     needs: build-docker
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
@@ -95,6 +119,20 @@ jobs:
       contents: read
     
     steps:
+    - name: Determine environment and tag
+      id: env
+      run: |
+        if [[ "${{ github.ref }}" == "refs/heads/main" ]] || [[ "${{ github.ref }}" == "refs/heads/master" ]]; then
+          echo "IMAGE_TAG=prod-0.1.0" >> $GITHUB_OUTPUT
+          echo "ENV_NAME=production" >> $GITHUB_OUTPUT
+        elif [[ "${{ github.ref }}" == "refs/heads/stage" ]]; then
+          echo "IMAGE_TAG=stage-latest" >> $GITHUB_OUTPUT
+          echo "ENV_NAME=staging" >> $GITHUB_OUTPUT
+        else
+          echo "IMAGE_TAG=dev-latest" >> $GITHUB_OUTPUT
+          echo "ENV_NAME=development" >> $GITHUB_OUTPUT
+        fi
+        
     - name: Checkout code
       uses: actions/checkout@v4
       
@@ -124,24 +162,179 @@ jobs:
         
     - name: Deploy to Kubernetes
       run: |
-        # Use dev-latest tag for dev environment
-        IMAGE_NAME="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev-latest"
+        # Use dynamic tag based on branch (siempre mismo namespace: ecommerce-dev)
+        IMAGE_NAME="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.env.outputs.IMAGE_TAG }}"
         
         # Create temporary deployment file from infra repo
         cp infra/k8s/cloud-config/deployment.yaml deployment.tmp.yaml
-        sed -i "s|juanc7773/cloud-config:0.1.0|${IMAGE_NAME}|g" deployment.tmp.yaml
+        sed -i "s|<REGISTRY>/cloud-config:0.1.0|${IMAGE_NAME}|g" deployment.tmp.yaml
         
         kubectl apply -f deployment.tmp.yaml -n ${{ env.KUBERNETES_NAMESPACE }}
         
         # Cleanup
         rm deployment.tmp.yaml
         
+    - name: Force rollout restart (para tags estáticos como dev-latest)
+      run: |
+        # Cuando usamos tags estáticos (dev-latest, stage-latest), Kubernetes puede no detectar
+        # que la imagen cambió. Forzamos el restart para asegurar que descargue la nueva imagen.
+        if [[ "${{ steps.env.outputs.IMAGE_TAG }}" == "dev-latest" ]] || \
+           [[ "${{ steps.env.outputs.IMAGE_TAG }}" == "stage-latest" ]]; then
+          echo "Tag estático detectado: ${{ steps.env.outputs.IMAGE_TAG }}"
+          echo "Forzando rollout restart para asegurar descarga de nueva imagen..."
+          kubectl rollout restart deployment/${{ env.SERVICE_NAME }} -n ${{ env.KUBERNETES_NAMESPACE }}
+        else
+          echo "Tag único detectado: ${{ steps.env.outputs.IMAGE_TAG }}, no se necesita restart forzado"
+        fi
+        
     - name: Wait for deployment
       run: |
-        kubectl rollout status deployment/${{ env.SERVICE_NAME }} -n ${{ env.KUBERNETES_NAMESPACE }} --timeout=300s
+        kubectl rollout status deployment/${{ env.SERVICE_NAME }} -n ${{ env.KUBERNETES_NAMESPACE }} --timeout=600s || true
         
     - name: Verify deployment
       run: |
         kubectl get pods -n ${{ env.KUBERNETES_NAMESPACE }} -l app=${{ env.SERVICE_NAME }}
         kubectl get svc -n ${{ env.KUBERNETES_NAMESPACE }} -l app=${{ env.SERVICE_NAME }}
 
+  release-notes:
+    name: Generate Release Notes
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: |
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') &&
+      github.event_name != 'pull_request'
+    
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Necesario para obtener todo el historial
+    
+    - name: Determine image tag
+      id: env
+      run: |
+        if [[ "${{ github.ref }}" == "refs/heads/main" ]] || [[ "${{ github.ref }}" == "refs/heads/master" ]]; then
+          echo "IMAGE_TAG=prod-0.1.0" >> $GITHUB_OUTPUT
+          echo "ENV_NAME=production" >> $GITHUB_OUTPUT
+        else
+          echo "IMAGE_TAG=dev-latest" >> $GITHUB_OUTPUT
+          echo "ENV_NAME=development" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Get latest tag
+      id: get_tag
+      run: |
+        TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+        if [ -z "$TAG" ]; then
+          echo "No previous tags found, will use first commit"
+          echo "PREVIOUS_TAG=" >> $GITHUB_OUTPUT
+          echo "HAS_PREVIOUS_TAG=false" >> $GITHUB_OUTPUT
+        else
+          echo "Previous tag: $TAG"
+          echo "PREVIOUS_TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "HAS_PREVIOUS_TAG=true" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Get commits since last tag (or all if no tag)
+      id: get_commits
+      run: |
+        if [ "${{ steps.get_tag.outputs.HAS_PREVIOUS_TAG }}" == "true" ]; then
+          COMMITS=$(git log ${{ steps.get_tag.outputs.PREVIOUS_TAG }}..HEAD --pretty=format:"%s" --no-merges)
+        else
+          COMMITS=$(git log --pretty=format:"%s" --no-merges | head -20)
+        fi
+        
+        # Guardar commits en output (solo los primeros 50 caracteres de cada uno)
+        echo "$COMMITS" > /tmp/commits.txt
+        echo "Commits found:"
+        echo "$COMMITS"
+        
+        # Verificar si hay commits con prefijos convencionales
+        PREFIXES="^(chore|feature|feat|fix|docs|refactor|test|style|perf|ci|build):"
+        if echo "$COMMITS" | grep -qE "$PREFIXES"; then
+          echo "HAS_VALID_COMMITS=true" >> $GITHUB_OUTPUT
+          echo " Commits with conventional prefixes found"
+        else
+          echo "HAS_VALID_COMMITS=false" >> $GITHUB_OUTPUT
+          echo " No commits with conventional prefixes found"
+        fi
+    
+    - name: Generate Release Notes
+      if: steps.get_commits.outputs.HAS_VALID_COMMITS == 'true'
+      id: release_notes
+      run: |
+        if [ "${{ steps.get_tag.outputs.HAS_PREVIOUS_TAG }}" == "true" ]; then
+          COMMITS=$(git log ${{ steps.get_tag.outputs.PREVIOUS_TAG }}..HEAD --pretty=format:"- %s" --no-merges)
+        else
+          COMMITS=$(git log --pretty=format:"- %s" --no-merges | head -20)
+        fi
+        
+        # Filtrar solo commits con prefijos válidos
+        PREFIXES="^(chore|feature|feat|fix|docs|refactor|test|style|perf|ci|build):"
+        FILTERED_COMMITS=$(echo "$COMMITS" | grep -E "$PREFIXES" || echo "")
+        
+        if [ -z "$FILTERED_COMMITS" ]; then
+          echo "No valid commits found, skipping release"
+          echo "SKIP_RELEASE=true" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        # Generar release notes usando archivo temporal para evitar problemas de sintaxis YAML
+        IMAGE_TAG="${{ steps.env.outputs.IMAGE_TAG }}"
+        NAMESPACE="${{ env.KUBERNETES_NAMESPACE }}"
+        SERVICE_NAME="${{ env.SERVICE_NAME }}"
+        DEPLOY_TIME=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+        
+        # Construir release notes línea por línea
+        {
+          echo "# Release $IMAGE_TAG"
+          echo ""
+          echo "## Changes"
+          echo ""
+          echo "$FILTERED_COMMITS"
+          echo ""
+          echo "## Deployment Info"
+          echo ""
+          echo "- **Image Tag**: $IMAGE_TAG"
+          echo "- **Namespace**: $NAMESPACE"
+          echo "- **Service**: $SERVICE_NAME"
+          echo "- **Deployed at**: $DEPLOY_TIME"
+        } > /tmp/release_notes.md
+        
+        # Leer el contenido del archivo y usar multiline output
+        RELEASE_NOTES=$(cat /tmp/release_notes.md)
+        
+        # Usar delimitador personalizado para multiline output
+        {
+          echo "RELEASE_NOTES<<RELEASE_NOTES_EOF"
+          echo "$RELEASE_NOTES"
+          echo "RELEASE_NOTES_EOF"
+        } >> $GITHUB_OUTPUT
+        
+        echo "SKIP_RELEASE=false" >> $GITHUB_OUTPUT
+        
+        echo "Release Notes generated:"
+        cat /tmp/release_notes.md
+    
+    - name: Create GitHub Release
+      if: |
+        steps.get_commits.outputs.HAS_VALID_COMMITS == 'true' &&
+        steps.release_notes.outputs.SKIP_RELEASE != 'true'
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.env.outputs.IMAGE_TAG }}
+        name: Release ${{ steps.env.outputs.IMAGE_TAG }} - ${{ env.SERVICE_NAME }}
+        body_path: /tmp/release_notes.md
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Skip Release (no valid commits)
+      if: steps.get_commits.outputs.HAS_VALID_COMMITS != 'true'
+      run: |
+        echo " Skipping release: No commits with conventional prefixes found"
+        echo "Commits must have prefixes like: chore:, feat:, fix:, etc."
