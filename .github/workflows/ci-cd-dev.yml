@@ -195,3 +195,135 @@ jobs:
       run: |
         kubectl get pods -n ${{ env.KUBERNETES_NAMESPACE }} -l app=${{ env.SERVICE_NAME }}
         kubectl get svc -n ${{ env.KUBERNETES_NAMESPACE }} -l app=${{ env.SERVICE_NAME }}
+
+  release-notes:
+    name: Generate Release Notes
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: |
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') &&
+      github.event_name != 'pull_request'
+    
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Necesario para obtener todo el historial
+    
+    - name: Determine image tag
+      id: env
+      run: |
+        if [[ "${{ github.ref }}" == "refs/heads/main" ]] || [[ "${{ github.ref }}" == "refs/heads/master" ]]; then
+          echo "IMAGE_TAG=prod-0.1.0" >> $GITHUB_OUTPUT
+          echo "ENV_NAME=production" >> $GITHUB_OUTPUT
+        else
+          echo "IMAGE_TAG=dev-latest" >> $GITHUB_OUTPUT
+          echo "ENV_NAME=development" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Get latest tag
+      id: get_tag
+      run: |
+        TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+        if [ -z "$TAG" ]; then
+          echo "No previous tags found, will use first commit"
+          echo "PREVIOUS_TAG=" >> $GITHUB_OUTPUT
+          echo "HAS_PREVIOUS_TAG=false" >> $GITHUB_OUTPUT
+        else
+          echo "Previous tag: $TAG"
+          echo "PREVIOUS_TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "HAS_PREVIOUS_TAG=true" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Get commits since last tag (or all if no tag)
+      id: get_commits
+      run: |
+        if [ "${{ steps.get_tag.outputs.HAS_PREVIOUS_TAG }}" == "true" ]; then
+          COMMITS=$(git log ${{ steps.get_tag.outputs.PREVIOUS_TAG }}..HEAD --pretty=format:"%s" --no-merges)
+        else
+          COMMITS=$(git log --pretty=format:"%s" --no-merges | head -20)
+        fi
+        
+        # Guardar commits en output (solo los primeros 50 caracteres de cada uno)
+        echo "$COMMITS" > /tmp/commits.txt
+        echo "Commits found:"
+        echo "$COMMITS"
+        
+        # Verificar si hay commits con prefijos convencionales
+        PREFIXES="^(chore|feature|feat|fix|docs|refactor|test|style|perf|ci|build):"
+        if echo "$COMMITS" | grep -qE "$PREFIXES"; then
+          echo "HAS_VALID_COMMITS=true" >> $GITHUB_OUTPUT
+          echo " Commits with conventional prefixes found"
+        else
+          echo "HAS_VALID_COMMITS=false" >> $GITHUB_OUTPUT
+          echo " No commits with conventional prefixes found"
+        fi
+    
+    - name: Generate Release Notes
+      if: steps.get_commits.outputs.HAS_VALID_COMMITS == 'true'
+      id: release_notes
+      run: |
+        if [ "${{ steps.get_tag.outputs.HAS_PREVIOUS_TAG }}" == "true" ]; then
+          COMMITS=$(git log ${{ steps.get_tag.outputs.PREVIOUS_TAG }}..HEAD --pretty=format:"- %s" --no-merges)
+        else
+          COMMITS=$(git log --pretty=format:"- %s" --no-merges | head -20)
+        fi
+        
+        # Filtrar solo commits con prefijos válidos
+        PREFIXES="^(chore|feature|feat|fix|docs|refactor|test|style|perf|ci|build):"
+        FILTERED_COMMITS=$(echo "$COMMITS" | grep -E "$PREFIXES" || echo "")
+        
+        if [ -z "$FILTERED_COMMITS" ]; then
+          echo "No valid commits found, skipping release"
+          echo "SKIP_RELEASE=true" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        # Generar release notes
+        RELEASE_NOTES=$(cat <<EOF
+# Release ${{ steps.env.outputs.IMAGE_TAG }}
+        
+## Changes
+        
+$FILTERED_COMMITS
+        
+## Deployment Info
+        
+- **Image Tag**: ${{ steps.env.outputs.IMAGE_TAG }}
+- **Namespace**: ${{ env.KUBERNETES_NAMESPACE }}
+- **Service**: ${{ env.SERVICE_NAME }}
+- **Deployed at**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+EOF
+        )
+        
+        echo "$RELEASE_NOTES" > /tmp/release_notes.md
+        echo "RELEASE_NOTES<<EOF" >> $GITHUB_OUTPUT
+        echo "$RELEASE_NOTES" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+        echo "SKIP_RELEASE=false" >> $GITHUB_OUTPUT
+        
+        echo " Release Notes generated:"
+        echo "$RELEASE_NOTES"
+    
+    - name: Create GitHub Release
+      if: |
+        steps.get_commits.outputs.HAS_VALID_COMMITS == 'true' &&
+        steps.release_notes.outputs.SKIP_RELEASE != 'true'
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.env.outputs.IMAGE_TAG }}
+        name: Release ${{ steps.env.outputs.IMAGE_TAG }}
+        body: ${{ steps.release_notes.outputs.RELEASE_NOTES }}
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Skip Release (no valid commits)
+      if: steps.get_commits.outputs.HAS_VALID_COMMITS != 'true'
+      run: |
+        echo " Skipping release: No commits with conventional prefixes found"
+        echo "Commits must have prefixes like: chore:, feat:, fix:, etc."
