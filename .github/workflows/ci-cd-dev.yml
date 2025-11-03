@@ -282,31 +282,42 @@ jobs:
           exit 0
         fi
         
-        # Generar release notes
-        RELEASE_NOTES=$(cat <<EOF
-# Release ${{ steps.env.outputs.IMAGE_TAG }}
+        # Generar release notes usando archivo temporal para evitar problemas de sintaxis YAML
+        IMAGE_TAG="${{ steps.env.outputs.IMAGE_TAG }}"
+        NAMESPACE="${{ env.KUBERNETES_NAMESPACE }}"
+        SERVICE_NAME="${{ env.SERVICE_NAME }}"
+        DEPLOY_TIME=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
         
-## Changes
+        # Construir release notes línea por línea
+        {
+          echo "# Release $IMAGE_TAG"
+          echo ""
+          echo "## Changes"
+          echo ""
+          echo "$FILTERED_COMMITS"
+          echo ""
+          echo "## Deployment Info"
+          echo ""
+          echo "- **Image Tag**: $IMAGE_TAG"
+          echo "- **Namespace**: $NAMESPACE"
+          echo "- **Service**: $SERVICE_NAME"
+          echo "- **Deployed at**: $DEPLOY_TIME"
+        } > /tmp/release_notes.md
         
-$FILTERED_COMMITS
+        # Leer el contenido del archivo y usar multiline output
+        RELEASE_NOTES=$(cat /tmp/release_notes.md)
         
-## Deployment Info
+        # Usar delimitador personalizado para multiline output
+        {
+          echo "RELEASE_NOTES<<RELEASE_NOTES_EOF"
+          echo "$RELEASE_NOTES"
+          echo "RELEASE_NOTES_EOF"
+        } >> $GITHUB_OUTPUT
         
-- **Image Tag**: ${{ steps.env.outputs.IMAGE_TAG }}
-- **Namespace**: ${{ env.KUBERNETES_NAMESPACE }}
-- **Service**: ${{ env.SERVICE_NAME }}
-- **Deployed at**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-EOF
-        )
-        
-        echo "$RELEASE_NOTES" > /tmp/release_notes.md
-        echo "RELEASE_NOTES<<EOF" >> $GITHUB_OUTPUT
-        echo "$RELEASE_NOTES" >> $GITHUB_OUTPUT
-        echo "EOF" >> $GITHUB_OUTPUT
         echo "SKIP_RELEASE=false" >> $GITHUB_OUTPUT
         
-        echo " Release Notes generated:"
-        echo "$RELEASE_NOTES"
+        echo "Release Notes generated:"
+        cat /tmp/release_notes.md
     
     - name: Create GitHub Release
       if: |
@@ -315,8 +326,8 @@ EOF
       uses: softprops/action-gh-release@v1
       with:
         tag_name: ${{ steps.env.outputs.IMAGE_TAG }}
-        name: Release ${{ steps.env.outputs.IMAGE_TAG }}
-        body: ${{ steps.release_notes.outputs.RELEASE_NOTES }}
+        name: Release ${{ steps.env.outputs.IMAGE_TAG }} - ${{ env.SERVICE_NAME }}
+        body_path: /tmp/release_notes.md
         draft: false
         prerelease: false
       env:
