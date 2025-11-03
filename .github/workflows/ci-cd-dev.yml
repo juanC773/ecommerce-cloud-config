@@ -288,19 +288,22 @@ jobs:
       run: |
         # Obtener commits de la misma manera que en el step anterior
         if [ -n "${{ github.event.head_commit.message }}" ]; then
-          COMMITS=$(echo "${{ github.event.head_commit.message }}" | sed 's/^/- /')
+          COMMIT_MSG="${{ github.event.head_commit.message }}"
+          echo "Using commit from event: $COMMIT_MSG"
         elif [ "${{ steps.get_tag.outputs.HAS_PREVIOUS_TAG }}" == "true" ]; then
-          COMMITS=$(git log ${{ steps.get_tag.outputs.PREVIOUS_TAG }}..HEAD --pretty=format:"- %s" --no-merges)
+          COMMIT_MSG=$(git log ${{ steps.get_tag.outputs.PREVIOUS_TAG }}..HEAD --pretty=format:"%s" --no-merges | head -1)
         else
-          COMMITS=$(echo "$(git log -1 --pretty=format:"%s" HEAD)" | sed 's/^/- /')
+          COMMIT_MSG=$(git log -1 --pretty=format:"%s" HEAD)
         fi
         
-        # Filtrar solo commits con prefijos válidos
+        echo "Processing commit: $COMMIT_MSG"
+        
+        # Filtrar solo commits con prefijos válidos (antes de agregar el prefijo "- ")
         PREFIXES="^(chore|feature|feat|fix|docs|refactor|test|style|perf|ci|build):"
-        FILTERED_COMMITS=$(echo "$COMMITS" | grep -E "$PREFIXES" || echo "")
+        FILTERED_COMMITS=$(echo "$COMMIT_MSG" | grep -E "$PREFIXES" | sed 's/^/- /' || echo "")
         
         if [ -z "$FILTERED_COMMITS" ]; then
-          echo "No valid commits found, skipping release"
+          echo "No valid commits found after filtering, skipping release"
           echo "SKIP_RELEASE=true" >> $GITHUB_OUTPUT
           exit 0
         fi
