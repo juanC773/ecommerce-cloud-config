@@ -1,4 +1,4 @@
-# Cloud Config Server
+# Cloud Config Server.
 
 ##  Descripción
 
