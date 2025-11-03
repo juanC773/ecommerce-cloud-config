@@ -238,38 +238,61 @@ jobs:
           echo "HAS_PREVIOUS_TAG=true" >> $GITHUB_OUTPUT
         fi
     
-    - name: Get commits since last tag (or all if no tag)
+    - name: Get commits since last tag (or from push)
       id: get_commits
       run: |
-        if [ "${{ steps.get_tag.outputs.HAS_PREVIOUS_TAG }}" == "true" ]; then
+        # Obtener commits del push actual (más confiable que usar tags)
+        # Si hay commits en el evento, usarlos; si no, usar desde el último tag o HEAD~1
+        if [ -n "${{ github.event.head_commit.message }}" ]; then
+          # Usar el commit del evento actual
+          COMMITS="${{ github.event.head_commit.message }}"
+          echo "Using commit from event: $COMMITS"
+        elif [ "${{ steps.get_tag.outputs.HAS_PREVIOUS_TAG }}" == "true" ]; then
           COMMITS=$(git log ${{ steps.get_tag.outputs.PREVIOUS_TAG }}..HEAD --pretty=format:"%s" --no-merges)
         else
-          COMMITS=$(git log --pretty=format:"%s" --no-merges | head -20)
+          # Si no hay tag, obtener el último commit
+          COMMITS=$(git log -1 --pretty=format:"%s" HEAD)
         fi
         
-        # Guardar commits en output (solo los primeros 50 caracteres de cada uno)
+        # Guardar commits en output para debugging
         echo "$COMMITS" > /tmp/commits.txt
-        echo "Commits found:"
+        echo "=== Commits found ==="
         echo "$COMMITS"
+        echo "===================="
         
         # Verificar si hay commits con prefijos convencionales
+        # Regex mejorada: permite espacios después del prefijo
         PREFIXES="^(chore|feature|feat|fix|docs|refactor|test|style|perf|ci|build):"
-        if echo "$COMMITS" | grep -qE "$PREFIXES"; then
+        
+        # Probar cada línea de commit
+        HAS_VALID=false
+        while IFS= read -r line; do
+          if [ -n "$line" ] && echo "$line" | grep -qE "$PREFIXES"; then
+            echo "✓ Valid commit found: $line"
+            HAS_VALID=true
+          fi
+        done <<< "$COMMITS"
+        
+        if [ "$HAS_VALID" == "true" ]; then
           echo "HAS_VALID_COMMITS=true" >> $GITHUB_OUTPUT
-          echo " Commits with conventional prefixes found"
+          echo "✓ Commits with conventional prefixes found"
         else
           echo "HAS_VALID_COMMITS=false" >> $GITHUB_OUTPUT
-          echo " No commits with conventional prefixes found"
+          echo "✗ No commits with conventional prefixes found"
+          echo "Looking for prefixes: chore:, feature:, feat:, fix:, docs:, refactor:, test:, style:, perf:, ci:, build:"
         fi
     
     - name: Generate Release Notes
       if: steps.get_commits.outputs.HAS_VALID_COMMITS == 'true'
       id: release_notes
       run: |
-        if [ "${{ steps.get_tag.outputs.HAS_PREVIOUS_TAG }}" == "true" ]; then
+        # Obtener commits de la misma manera que en el step anterior
+        if [ -n "${{ github.event.head_commit.message }}" ]; then
+          COMMITS=$(echo "${{ github.event.head_commit.message }}" | sed 's/^/- /')
+        elif [ "${{ steps.get_tag.outputs.HAS_PREVIOUS_TAG }}" == "true" ]; then
           COMMITS=$(git log ${{ steps.get_tag.outputs.PREVIOUS_TAG }}..HEAD --pretty=format:"- %s" --no-merges)
         else
-          COMMITS=$(git log --pretty=format:"- %s" --no-merges | head -20)
+          COMMITS=$(echo "$(git log -1 --pretty=format:"%s" HEAD)" | sed 's/^/- /')
         fi
         
         # Filtrar solo commits con prefijos válidos
@@ -281,6 +304,9 @@ jobs:
           echo "SKIP_RELEASE=true" >> $GITHUB_OUTPUT
           exit 0
         fi
+        
+        echo "Filtered commits:"
+        echo "$FILTERED_COMMITS"
         
         # Generar release notes usando archivo temporal para evitar problemas de sintaxis YAML
         IMAGE_TAG="${{ steps.env.outputs.IMAGE_TAG }}"
